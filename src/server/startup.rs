@@ -15,10 +15,7 @@ use crate::{
     server::{handle_client, Message},
 };
 
-pub async fn run() {
-    env_logger::init();
-
-    let listener = TcpListener::bind("127.0.0.1:9132").await.unwrap();
+pub async fn run(listener: TcpListener) {
     let mut state = GameState::new();
     let msg_q = Arc::new(Mutex::new(VecDeque::<Message>::new()));
     let (tx, _rx) = broadcast::channel(10);
@@ -42,7 +39,9 @@ pub async fn run() {
     let mut time = Instant::now();
     loop {
         // wait until x time passes
-        if time.elapsed() > Duration::from_millis(1) {
+        // Currently, the server is set to send updates every 8ms.
+        // This is to target 128 updates per second.
+        if time.elapsed() > Duration::from_millis(8) {
             let msg_q_copy;
             {
                 // grab control over message queue

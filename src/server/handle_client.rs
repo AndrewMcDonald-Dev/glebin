@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
@@ -46,6 +46,7 @@ pub async fn handle_client(
                         match serde_json::from_str::<(f32, f32)>(&message) {
                             Ok(pos) => {
                                 let (x, y) = pos;
+                                debug!("Received coordinates from player {}: ({}, {})", player_id, x, y);
                                 // Create UpdatePlayerPosition messages and add it to msg_q
                                 {
                                     let mut msg_q = msg_q.lock().await;

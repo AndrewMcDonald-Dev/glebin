@@ -15,8 +15,9 @@ def main():
                 x = random.random() * 10 
                 y = random.random() * 10 
                 pos = (x, y)
-                message = json.dumps(pos)
-                s.sendall(message.encode('utf-8'))
+                message = json.dumps(pos).encode('utf-8')
+                print(f"Sending player position: {pos}")
+                s.sendall(message)
                 print(f"Sent player position: {pos}")
                 # Receive the updated game state
                 data = s.recv(1024)
