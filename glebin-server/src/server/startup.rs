@@ -1,76 +1,120 @@
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{io, time::Duration};
 
+use glebin_protocol::{to_line, ServerMessage, WorldConfig};
 use log::{debug, info};
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, Mutex},
+    sync::{broadcast, mpsc},
+    time::{self, MissedTickBehavior},
 };
+use uuid::Uuid;
 
-use crate::{
-    game::GameState,
-    server::{handle_client, Message},
-};
+use crate::{game::GameState, server::handle_client};
 
-pub async fn run(listener: TcpListener) {
-    let mut state = GameState::new();
-    let msg_q = Arc::new(Mutex::new(VecDeque::<Message>::new()));
-    let (tx, _rx) = broadcast::channel(10);
-    info!("Server started on 127.0.0.1:8080");
+use super::ServerCommand;
 
-    {
-        let msg_q = msg_q.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                let msg_q = msg_q.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    handle_client(socket, msg_q, tx).await;
-                });
-            }
-        });
-    }
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub tick_rate_hz: u16,
+    pub broadcast_channel_capacity: usize,
+    pub world: WorldConfig,
+}
 
-    let mut time = Instant::now();
-    loop {
-        // wait until x time passes
-        // Currently, the server is set to send updates every 8ms.
-        // This is to target 128 updates per second.
-        if time.elapsed() > Duration::from_millis(8) {
-            let msg_q_copy;
-            {
-                // grab control over message queue
-                let mut msg_q = msg_q.lock().await;
-
-                // copy message queue
-                msg_q_copy = msg_q.clone();
-
-                // clear original queue
-                msg_q.clear();
-
-                // let go of control over message queue
-            }
-
-            // process state with message queue
-            state.process_messages(msg_q_copy).unwrap();
-
-            // Send new state to all subscribers.
-            let state_string = state.get_state();
-            let num_received = tx
-                .send(state_string.clone())
-                .expect("Could not send message.");
-            debug!(
-                "{} clients received message: {}",
-                num_received, state_string
-            );
-
-            // reset timer
-            time = Instant::now();
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            tick_rate_hz: 128,
+            broadcast_channel_capacity: 256,
+            world: WorldConfig::default(),
         }
     }
+}
+
+pub async fn run(listener: TcpListener) -> io::Result<()> {
+    run_with_config(listener, ServerConfig::default()).await
+}
+
+async fn run_with_config(listener: TcpListener, config: ServerConfig) -> io::Result<()> {
+    let local_addr = listener.local_addr()?;
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel::<ServerCommand>();
+    let (message_tx, _) = broadcast::channel::<String>(config.broadcast_channel_capacity);
+    let mut state = GameState::new(config.world.clone());
+    let mut ticker = time::interval(tick_duration(config.tick_rate_hz));
+    let mut player_sequence: u64 = 0;
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    info!(
+        "Server listening on {} at {} ticks/sec (world: {}x{})",
+        local_addr, config.tick_rate_hz, config.world.width, config.world.height
+    );
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (socket, peer_addr) = accept_result?;
+                player_sequence = player_sequence.wrapping_add(1);
+                let player_id = Uuid::new_v4();
+                let player_glyph = player_glyph(player_sequence - 1);
+                let player_name = default_player_name(player_glyph);
+                debug!(
+                    "Accepted connection from {} as {} ({}, {})",
+                    peer_addr,
+                    player_id,
+                    player_name,
+                    player_glyph
+                );
+                tokio::spawn(handle_client(
+                    socket,
+                    command_tx.clone(),
+                    message_tx.subscribe(),
+                    config.tick_rate_hz,
+                    config.world.clone(),
+                    player_id,
+                    player_glyph,
+                    player_name,
+                ));
+            }
+            _ = ticker.tick() => {
+                while let Ok(command) = command_rx.try_recv() {
+                    for message in state.apply(command) {
+                        broadcast_message(&message_tx, &message)?;
+                    }
+                }
+
+                if message_tx.receiver_count() == 0 {
+                    continue;
+                }
+
+                let snapshot = state.snapshot();
+                broadcast_message(&message_tx, &ServerMessage::Snapshot { snapshot })?;
+            }
+        }
+    }
+}
+
+fn broadcast_message(
+    message_tx: &broadcast::Sender<String>,
+    message: &ServerMessage,
+) -> io::Result<()> {
+    let payload =
+        to_line(message).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let _ = message_tx.send(payload);
+    Ok(())
+}
+
+fn tick_duration(tick_rate_hz: u16) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(tick_rate_hz.max(1)))
+}
+
+fn player_glyph(index: u64) -> char {
+    const GLYPHS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+    GLYPHS
+        .get(index as usize % GLYPHS.len())
+        .copied()
+        .map(char::from)
+        .unwrap_or('@')
+}
+
+fn default_player_name(glyph: char) -> String {
+    format!("Pilot-{glyph}")
 }
