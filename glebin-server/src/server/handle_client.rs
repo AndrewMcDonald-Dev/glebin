@@ -1,6 +1,6 @@
 use std::io;
 
-use glebin_protocol::{to_line, ClientMessage, ServerMessage, WorldConfig};
+use glebin_protocol::{to_line, ChatMessage, ClientMessage, ServerMessage, WorldConfig};
 use log::{debug, info, warn};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -15,20 +15,26 @@ pub async fn handle_client(
     socket: TcpStream,
     command_tx: mpsc::UnboundedSender<ServerCommand>,
     mut message_rx: broadcast::Receiver<String>,
+    mut direct_rx: mpsc::UnboundedReceiver<String>,
+    chat_history: Vec<ChatMessage>,
     tick_rate_hz: u16,
     world: WorldConfig,
     player_id: Uuid,
     player_glyph: char,
+    player_color: u8,
     player_name: String,
 ) {
     if let Err(error) = run_client_loop(
         socket,
         &command_tx,
         &mut message_rx,
+        &mut direct_rx,
+        chat_history,
         tick_rate_hz,
         world,
         player_id,
         player_glyph,
+        player_color,
         &player_name,
     )
     .await
@@ -41,10 +47,13 @@ async fn run_client_loop(
     socket: TcpStream,
     command_tx: &mpsc::UnboundedSender<ServerCommand>,
     message_rx: &mut broadcast::Receiver<String>,
+    direct_rx: &mut mpsc::UnboundedReceiver<String>,
+    chat_history: Vec<ChatMessage>,
     tick_rate_hz: u16,
     world: WorldConfig,
     player_id: Uuid,
     player_glyph: char,
+    player_color: u8,
     player_name: &str,
 ) -> io::Result<()> {
     let (reader, mut writer) = socket.into_split();
@@ -55,6 +64,7 @@ async fn run_client_loop(
         ServerCommand::Connect {
             player_id,
             glyph: player_glyph,
+            ui_color: player_color,
             name: player_name.to_string(),
         },
     )?;
@@ -64,12 +74,16 @@ async fn run_client_loop(
             player_id,
             player_glyph,
             player_name: player_name.to_string(),
+            player_color,
             tick_rate_hz,
             world,
         },
     )
     .await?;
-    info!("Player {player_id} connected as {player_name} ({player_glyph})");
+    for message in chat_history {
+        write_message(&mut writer, &ServerMessage::Chat { message }).await?;
+    }
+    info!("Player {player_id} connected as {player_name} ({player_glyph}, color {player_color})");
 
     let result = loop {
         tokio::select! {
@@ -108,6 +122,12 @@ async fn run_client_loop(
                         warn!("Player {player_id} lagged behind by {skipped} messages");
                     }
                     Err(broadcast::error::RecvError::Closed) => break Ok(()),
+                }
+            }
+            direct_message = direct_rx.recv() => {
+                match direct_message {
+                    Some(message) => writer.write_all(message.as_bytes()).await?,
+                    None => break Ok(()),
                 }
             }
         }

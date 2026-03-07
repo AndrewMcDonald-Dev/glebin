@@ -98,6 +98,7 @@ pub struct PlayerState {
     pub glyph: char,
     pub name: String,
     pub score: u32,
+    pub ui_color: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,6 +112,7 @@ pub struct Snapshot {
 pub enum ChatKind {
     Player,
     System,
+    Whisper,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +120,9 @@ pub struct ChatMessage {
     pub from: String,
     pub text: String,
     pub kind: ChatKind,
+    pub to: Option<String>,
+    pub glyph: Option<char>,
+    pub ui_color: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +140,7 @@ pub enum ServerMessage {
         player_id: Uuid,
         player_glyph: char,
         player_name: String,
+        player_color: u8,
         tick_rate_hz: u16,
         world: WorldConfig,
     },

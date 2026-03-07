@@ -1,3 +1,4 @@
+use glebin_protocol::ServerMessage;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5,6 +6,7 @@ pub enum ServerCommand {
     Connect {
         player_id: Uuid,
         glyph: char,
+        ui_color: u8,
         name: String,
     },
     Disconnect {
@@ -23,4 +25,14 @@ pub enum ServerCommand {
         player_id: Uuid,
         text: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerEvent {
+    Broadcast(ServerMessage),
+    Direct {
+        player_id: Uuid,
+        message: ServerMessage,
+    },
+    Audit(String),
 }
