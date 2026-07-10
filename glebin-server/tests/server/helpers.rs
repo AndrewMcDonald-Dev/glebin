@@ -4,22 +4,36 @@ use glebin_protocol::ServerMessage;
 use tokio::{
     io::BufReader,
     net::{tcp::OwnedReadHalf, TcpListener, TcpStream},
+    sync::oneshot,
     time::timeout,
 };
 
 pub struct TestApp {
     port: u16,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl TestApp {
     pub async fn spawn() -> Self {
+        Self::spawn_with_config(glebin_server::server::ServerConfig::default()).await
+    }
+
+    pub async fn spawn_with_config(config: glebin_server::server::ServerConfig) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
-            glebin_server::server::run(listener).await.unwrap();
+            glebin_server::server::run_with_config_until(listener, config, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
         });
 
-        Self { port }
+        Self {
+            port,
+            shutdown: Some(shutdown_tx),
+        }
     }
 
     pub async fn connect(&self) -> TcpStream {
@@ -30,6 +44,14 @@ impl TestApp {
         .await
         .expect("timed out connecting to test server")
         .expect("failed to connect to test server")
+    }
+}
+
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
     }
 }
 

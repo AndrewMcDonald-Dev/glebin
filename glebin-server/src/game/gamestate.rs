@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use glebin_protocol::{
     ChatKind, ChatMessage, CollectibleState, PlayerState, Point, ServerMessage, Snapshot,
-    WorldConfig,
+    WorldConfig, MAX_CHAT_LEN, MAX_NAME_LEN,
 };
 use uuid::Uuid;
 
@@ -13,6 +13,7 @@ pub struct GameState {
     world: WorldConfig,
     players: HashMap<Uuid, PlayerState>,
     collectibles: HashMap<u16, CollectibleState>,
+    pending_collectibles: Vec<CollectibleState>,
     collectible_spawns: Vec<Point>,
     solid_tiles: HashSet<Point>,
     tick: u64,
@@ -22,11 +23,29 @@ pub struct GameState {
 }
 
 impl GameState {
-    pub fn new(world: WorldConfig) -> Self {
-        Self::with_collectible_spawns(world, default_collectible_spawns())
+    pub fn new(world: WorldConfig) -> Result<Self, String> {
+        let collectible_spawns = default_collectible_spawns()
+            .into_iter()
+            .filter(|position| position.x < world.width && position.y < world.height)
+            .collect();
+        Self::with_collectible_spawns(world, collectible_spawns)
     }
 
-    fn with_collectible_spawns(world: WorldConfig, collectible_spawns: Vec<Point>) -> Self {
+    fn with_collectible_spawns(
+        world: WorldConfig,
+        collectible_spawns: Vec<Point>,
+    ) -> Result<Self, String> {
+        world.validate()?;
+        if let Some(position) = collectible_spawns
+            .iter()
+            .find(|position| position.x >= world.width || position.y >= world.height)
+        {
+            return Err(format!(
+                "collectible spawn ({}, {}) is outside the {}x{} world",
+                position.x, position.y, world.width, world.height
+            ));
+        }
+
         let solid_tiles = world
             .features
             .iter()
@@ -38,6 +57,7 @@ impl GameState {
             world,
             players: HashMap::new(),
             collectibles: HashMap::new(),
+            pending_collectibles: Vec::new(),
             collectible_spawns,
             solid_tiles,
             tick: 0,
@@ -47,7 +67,7 @@ impl GameState {
         };
 
         state.seed_collectibles(3);
-        state
+        Ok(state)
     }
 
     pub fn apply(&mut self, command: ServerCommand) -> Vec<ServerEvent> {
@@ -65,8 +85,12 @@ impl GameState {
         }
     }
 
-    pub fn snapshot(&mut self) -> Snapshot {
+    pub fn advance_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.respawn_pending_collectibles();
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
         let mut collectibles = self.collectibles.values().cloned().collect::<Vec<_>>();
         collectibles.sort_by_key(|collectible| collectible.id);
         Snapshot {
@@ -116,12 +140,27 @@ impl GameState {
             return Vec::new();
         };
 
+        if !matches!((dx, dy), (-1, 0) | (1, 0) | (0, -1) | (0, 1)) {
+            return self.direct_error(
+                player_id,
+                "movement must be exactly one cardinal tile".to_string(),
+            );
+        }
+
         let next_position = Point::new(
             clamp_axis(current_position.x, dx, self.world.width),
             clamp_axis(current_position.y, dy, self.world.height),
         );
 
         if self.solid_tiles.contains(&next_position) {
+            return Vec::new();
+        }
+
+        if self
+            .players
+            .iter()
+            .any(|(other_id, player)| *other_id != player_id && player.position == next_position)
+        {
             return Vec::new();
         }
 
@@ -182,7 +221,7 @@ impl GameState {
             return Vec::new();
         };
 
-        let Some(collectible) = self.collectibles.get(&collectible_id).cloned() else {
+        let Some(mut collectible) = self.collectibles.remove(&collectible_id) else {
             return Vec::new();
         };
 
@@ -195,9 +234,11 @@ impl GameState {
         }
 
         if let Some(next_position) = self.next_available_collectible_position() {
-            if let Some(entry) = self.collectibles.get_mut(&collectible_id) {
-                entry.position = next_position;
-            }
+            collectible.position = next_position;
+            self.collectibles
+                .insert(collectible_id, collectible.clone());
+        } else {
+            self.pending_collectibles.push(collectible.clone());
         }
 
         self.broadcast_system_chat(format!(
@@ -263,8 +304,9 @@ impl GameState {
     }
 
     fn name_in_use(&self, candidate: &str, exclude_player_id: Option<Uuid>) -> bool {
+        let candidate = name_key(candidate);
         self.players.iter().any(|(player_id, player)| {
-            Some(*player_id) != exclude_player_id && player.name == candidate
+            Some(*player_id) != exclude_player_id && name_key(&player.name) == candidate
         })
     }
 
@@ -409,12 +451,17 @@ impl GameState {
         }]
     }
 
+    fn direct_error(&self, player_id: Uuid, message: String) -> Vec<ServerEvent> {
+        vec![ServerEvent::Direct {
+            player_id,
+            message: ServerMessage::Error { message },
+        }]
+    }
+
     fn find_player_by_name(&self, name: &str) -> Option<(Uuid, PlayerState)> {
+        let name = name_key(name);
         self.players.iter().find_map(|(player_id, player)| {
-            player
-                .name
-                .eq_ignore_ascii_case(name)
-                .then_some((*player_id, player.clone()))
+            (name_key(&player.name) == name).then_some((*player_id, player.clone()))
         })
     }
 
@@ -475,6 +522,18 @@ impl GameState {
             );
         }
     }
+
+    fn respawn_pending_collectibles(&mut self) {
+        let pending = std::mem::take(&mut self.pending_collectibles);
+        for mut collectible in pending {
+            if let Some(position) = self.next_available_collectible_position() {
+                collectible.position = position;
+                self.collectibles.insert(collectible.id, collectible);
+            } else {
+                self.pending_collectibles.push(collectible);
+            }
+        }
+    }
 }
 
 fn clamp_axis(current: u16, delta: i16, max: u16) -> u16 {
@@ -486,7 +545,7 @@ fn sanitize_name(name: &str, fallback: &str) -> String {
     let sanitized = name
         .trim()
         .chars()
-        .filter(|ch| !ch.is_control())
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
         .take(MAX_NAME_LEN)
         .collect::<String>();
 
@@ -495,6 +554,10 @@ fn sanitize_name(name: &str, fallback: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn name_key(name: &str) -> String {
+    name.chars().flat_map(char::to_lowercase).collect()
 }
 
 fn suffix_name(base: &str, suffix: u32) -> String {
@@ -516,7 +579,7 @@ fn sanitize_chat(text: &str) -> Option<String> {
         .trim()
         .chars()
         .filter(|ch| !ch.is_control() || *ch == ' ')
-        .take(160)
+        .take(MAX_CHAT_LEN)
         .collect::<String>();
 
     (!sanitized.is_empty()).then_some(sanitized)
@@ -542,7 +605,6 @@ fn audit_line(message: &ChatMessage) -> String {
     }
 }
 
-const MAX_NAME_LEN: usize = 16;
 const CHAT_HISTORY_LIMIT: usize = 20;
 
 fn default_collectible_spawns() -> Vec<Point> {
@@ -573,7 +635,7 @@ mod tests {
 
     #[test]
     fn ignores_moves_for_unknown_players() {
-        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new());
+        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new()).unwrap();
         let player_id = Uuid::new_v4();
 
         let events = state.apply(ServerCommand::Move {
@@ -589,7 +651,7 @@ mod tests {
 
     #[test]
     fn tracks_connect_move_and_disconnect() {
-        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new());
+        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new()).unwrap();
         let player_id = Uuid::new_v4();
 
         state.apply(ServerCommand::Connect {
@@ -600,8 +662,18 @@ mod tests {
         });
         state.apply(ServerCommand::Move {
             player_id,
-            dx: 2,
+            dx: 0,
             dy: 1,
+        });
+        state.apply(ServerCommand::Move {
+            player_id,
+            dx: 1,
+            dy: 0,
+        });
+        state.apply(ServerCommand::Move {
+            player_id,
+            dx: 1,
+            dy: 0,
         });
 
         let snapshot = state.snapshot();
@@ -623,7 +695,7 @@ mod tests {
 
     #[test]
     fn blocks_solid_tiles() {
-        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new());
+        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new()).unwrap();
         let player_id = Uuid::new_v4();
 
         state.apply(ServerCommand::Connect {
@@ -655,7 +727,8 @@ mod tests {
                 Point::new(4, 0),
                 Point::new(5, 2),
             ],
-        );
+        )
+        .unwrap();
         let player_id = Uuid::new_v4();
 
         state.apply(ServerCommand::Connect {
@@ -680,7 +753,7 @@ mod tests {
 
     #[test]
     fn renames_players_and_emits_system_chat() {
-        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new());
+        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new()).unwrap();
         let player_id = Uuid::new_v4();
 
         state.apply(ServerCommand::Connect {
@@ -698,5 +771,135 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, ServerEvent::Broadcast(ServerMessage::Chat { .. }))));
+    }
+
+    #[test]
+    fn rejects_teleports_and_diagonal_movement() {
+        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new()).unwrap();
+        let player_id = Uuid::new_v4();
+        state.apply(ServerCommand::Connect {
+            player_id,
+            glyph: 'E',
+            ui_color: 77,
+            name: "Mover".to_string(),
+        });
+
+        for (dx, dy) in [(2, 0), (1, 1), (0, 0)] {
+            let events = state.apply(ServerCommand::Move { player_id, dx, dy });
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ServerEvent::Direct {
+                    message: ServerMessage::Error { .. },
+                    ..
+                }
+            )));
+        }
+        assert_eq!(state.players[&player_id].position, Point::new(0, 0));
+    }
+
+    #[test]
+    fn blocks_movement_into_other_players() {
+        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new()).unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        for (player_id, glyph) in [(first, 'F'), (second, 'G')] {
+            state.apply(ServerCommand::Connect {
+                player_id,
+                glyph,
+                ui_color: 88,
+                name: glyph.to_string(),
+            });
+        }
+        assert_eq!(state.players[&first].position, Point::new(0, 0));
+        assert_eq!(state.players[&second].position, Point::new(2, 0));
+
+        state.apply(ServerCommand::Move {
+            player_id: first,
+            dx: 0,
+            dy: 1,
+        });
+        state.apply(ServerCommand::Move {
+            player_id: first,
+            dx: 1,
+            dy: 0,
+        });
+        state.apply(ServerCommand::Move {
+            player_id: second,
+            dx: 0,
+            dy: 1,
+        });
+        state.apply(ServerCommand::Move {
+            player_id: second,
+            dx: -1,
+            dy: 0,
+        });
+        assert_eq!(state.players[&first].position, Point::new(1, 1));
+        assert_eq!(state.players[&second].position, Point::new(2, 1));
+    }
+
+    #[test]
+    fn names_are_unique_case_insensitively_and_have_no_whitespace() {
+        let mut state = GameState::with_collectible_spawns(test_world(), Vec::new()).unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        state.apply(ServerCommand::Connect {
+            player_id: first,
+            glyph: 'H',
+            ui_color: 99,
+            name: "Alice Smith".to_string(),
+        });
+        state.apply(ServerCommand::Connect {
+            player_id: second,
+            glyph: 'I',
+            ui_color: 100,
+            name: "alicesmith".to_string(),
+        });
+
+        assert_eq!(state.players[&first].name, "AliceSmith");
+        assert_eq!(state.players[&second].name, "alicesmith2");
+    }
+
+    #[test]
+    fn collected_items_wait_for_a_free_respawn_without_scoring_twice() {
+        let mut state =
+            GameState::with_collectible_spawns(test_world(), vec![Point::new(0, 1)]).unwrap();
+        let player_id = Uuid::new_v4();
+        state.apply(ServerCommand::Connect {
+            player_id,
+            glyph: 'J',
+            ui_color: 101,
+            name: "Collector".to_string(),
+        });
+        state.apply(ServerCommand::Move {
+            player_id,
+            dx: 0,
+            dy: 1,
+        });
+        state.advance_tick();
+        state.apply(ServerCommand::Move {
+            player_id,
+            dx: 0,
+            dy: 0,
+        });
+
+        assert_eq!(state.players[&player_id].score, 1);
+        assert!(state.collectibles.is_empty());
+        assert_eq!(state.pending_collectibles.len(), 1);
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_world_content() {
+        let world = WorldConfig {
+            width: 1,
+            height: 1,
+            features: vec![WorldFeature::new(Point::new(1, 0), '#', true, "bad wall")],
+        };
+        assert!(GameState::with_collectible_spawns(world, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn supports_valid_worlds_smaller_than_default_collectible_map() {
+        let state = GameState::new(WorldConfig::empty(2, 2)).unwrap();
+        assert!(state.collectibles.is_empty());
     }
 }

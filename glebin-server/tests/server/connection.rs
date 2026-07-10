@@ -16,6 +16,7 @@ async fn test_connection_receives_welcome_with_identity_metadata() {
     let message = next_message(&mut lines).await.unwrap();
     match message {
         ServerMessage::Welcome {
+            protocol_version,
             player_id: _,
             player_glyph,
             player_name,
@@ -23,6 +24,7 @@ async fn test_connection_receives_welcome_with_identity_metadata() {
             tick_rate_hz,
             world,
         } => {
+            assert_eq!(protocol_version, glebin_protocol::PROTOCOL_VERSION);
             assert_eq!(tick_rate_hz, 128);
             assert_eq!(player_glyph, 'A');
             assert_eq!(player_name, "Pilot-A");
@@ -42,6 +44,7 @@ async fn test_renaming_and_movement_are_reflected_in_snapshots() {
 
     let player_id = match next_message(&mut lines).await.unwrap() {
         ServerMessage::Welcome {
+            protocol_version: _,
             player_id,
             player_glyph: _,
             player_name: _,
@@ -62,14 +65,18 @@ async fn test_renaming_and_movement_are_reflected_in_snapshots() {
         )
         .await
         .unwrap();
-    writer
-        .write_all(
-            glebin_protocol::to_line(&ClientMessage::Move { dx: 3, dy: 2 })
-                .unwrap()
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
+    for movement in [
+        ClientMessage::Move { dx: 0, dy: 1 },
+        ClientMessage::Move { dx: 0, dy: 1 },
+        ClientMessage::Move { dx: 1, dy: 0 },
+        ClientMessage::Move { dx: 1, dy: 0 },
+        ClientMessage::Move { dx: 1, dy: 0 },
+    ] {
+        writer
+            .write_all(glebin_protocol::to_line(&movement).unwrap().as_bytes())
+            .await
+            .unwrap();
+    }
     writer.flush().await.unwrap();
 
     let snapshot = timeout(Duration::from_secs(1), async {
@@ -170,6 +177,7 @@ async fn test_duplicate_requested_names_get_numbered() {
 
     let first_player_id = match next_message(&mut first_lines).await.unwrap() {
         ServerMessage::Welcome {
+            protocol_version: _,
             player_id,
             player_glyph: _,
             player_name: _,
@@ -181,6 +189,7 @@ async fn test_duplicate_requested_names_get_numbered() {
     };
     let second_player_id = match next_message(&mut second_lines).await.unwrap() {
         ServerMessage::Welcome {
+            protocol_version: _,
             player_id,
             player_glyph: _,
             player_name: _,
@@ -273,6 +282,7 @@ async fn test_whispers_are_private_and_reply_works() {
 
     let first_player_id = match next_message(&mut first_lines).await.unwrap() {
         ServerMessage::Welcome {
+            protocol_version: _,
             player_id,
             player_glyph: _,
             player_name: _,
@@ -284,6 +294,7 @@ async fn test_whispers_are_private_and_reply_works() {
     };
     let second_player_id = match next_message(&mut second_lines).await.unwrap() {
         ServerMessage::Welcome {
+            protocol_version: _,
             player_id,
             player_glyph: _,
             player_name: _,
@@ -530,4 +541,192 @@ async fn test_new_clients_receive_recent_chat_history() {
     .expect("timed out waiting for history replay");
 
     assert_eq!(history_message.to, None);
+}
+
+#[tokio::test]
+async fn test_invalid_movement_is_rejected_without_moving_player() {
+    let app = TestApp::spawn().await;
+    let stream = app.connect().await;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let player_id = match next_message(&mut lines).await.unwrap() {
+        ServerMessage::Welcome { player_id, .. } => player_id,
+        other => panic!("expected welcome message, got {other:?}"),
+    };
+
+    writer
+        .write_all(
+            glebin_protocol::to_line(&ClientMessage::Move { dx: 50, dy: 50 })
+                .unwrap()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut saw_error = false;
+    let position = timeout(Duration::from_secs(1), async {
+        loop {
+            match next_message(&mut lines).await.unwrap() {
+                ServerMessage::Error { message } => {
+                    saw_error = message.contains("cardinal");
+                }
+                ServerMessage::Snapshot { snapshot } if saw_error => {
+                    if let Some(player) = snapshot.players.get(&player_id) {
+                        break player.position;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for invalid movement response");
+    assert_eq!(position.x, 0);
+    assert_eq!(position.y, 0);
+}
+
+#[tokio::test]
+async fn test_case_only_duplicate_names_are_numbered() {
+    let app = TestApp::spawn().await;
+    let first = app.connect().await;
+    let second = app.connect().await;
+    let (first_reader, mut first_writer) = first.into_split();
+    let (second_reader, mut second_writer) = second.into_split();
+    let mut first_lines = BufReader::new(first_reader).lines();
+    let mut second_lines = BufReader::new(second_reader).lines();
+    let first_id = match next_message(&mut first_lines).await.unwrap() {
+        ServerMessage::Welcome { player_id, .. } => player_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    let second_id = match next_message(&mut second_lines).await.unwrap() {
+        ServerMessage::Welcome { player_id, .. } => player_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    for (writer, name) in [(&mut first_writer, "Alice"), (&mut second_writer, "alice")] {
+        writer
+            .write_all(
+                glebin_protocol::to_line(&ClientMessage::SetName {
+                    name: name.to_string(),
+                })
+                .unwrap()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let names = timeout(Duration::from_secs(1), async {
+        loop {
+            if let ServerMessage::Snapshot { snapshot } =
+                next_message(&mut first_lines).await.unwrap()
+            {
+                if let (Some(first), Some(second)) = (
+                    snapshot.players.get(&first_id),
+                    snapshot.players.get(&second_id),
+                ) {
+                    if first.name.to_lowercase() != second.name.to_lowercase() {
+                        break (first.name.clone(), second.name.clone());
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for normalized unique names");
+    assert_eq!(names.0, "Alice");
+    assert_eq!(names.1, "alice2");
+}
+
+#[tokio::test]
+async fn test_oversized_client_frames_close_the_connection() {
+    let app = TestApp::spawn().await;
+    let stream = app.connect().await;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let player_id = match next_message(&mut lines).await.unwrap() {
+        ServerMessage::Welcome { player_id, .. } => player_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let ServerMessage::Snapshot { snapshot } = next_message(&mut lines).await.unwrap() {
+                if snapshot.players.contains_key(&player_id) {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("player was never registered before oversized frame test");
+
+    let observer = app.connect().await;
+    let (observer_reader, _observer_writer) = observer.into_split();
+    let mut observer_lines = BufReader::new(observer_reader).lines();
+    let _ = next_message(&mut observer_lines).await.unwrap();
+
+    let mut oversized = vec![b'x'; glebin_protocol::MAX_CLIENT_LINE_LEN + 1];
+    oversized.push(b'\n');
+    writer.write_all(&oversized).await.unwrap();
+
+    let closed = timeout(Duration::from_secs(1), async {
+        loop {
+            match lines.next_line().await {
+                Ok(Some(_)) => continue,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for oversized frame disconnect");
+    assert!(matches!(closed, Ok(None) | Err(_)));
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let ServerMessage::Snapshot { snapshot } =
+                next_message(&mut observer_lines).await.unwrap()
+            {
+                if !snapshot.players.contains_key(&player_id) {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("oversized frame left a ghost player in server state");
+}
+
+#[tokio::test]
+async fn test_per_client_rate_limit_returns_an_error() {
+    let config = glebin_server::server::ServerConfig {
+        max_client_messages_per_second: 2,
+        ..Default::default()
+    };
+    let app = TestApp::spawn_with_config(config).await;
+    let stream = app.connect().await;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let _ = next_message(&mut lines).await.unwrap();
+
+    for _ in 0..3 {
+        writer
+            .write_all(
+                glebin_protocol::to_line(&ClientMessage::Move { dx: 0, dy: 1 })
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let ServerMessage::Error { message } = next_message(&mut lines).await.unwrap() {
+                if message.contains("rate limit") {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for rate limit error");
 }
